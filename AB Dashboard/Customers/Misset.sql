@@ -48,33 +48,52 @@ WITH raw AS (
 ),
 
 kpi_events AS (
+  -- keep only the six KPI event types & purchases
   SELECT *
-  FROM   raw
-  WHERE  event_name IN ('view_item_list','select_item','view_item',
-                        'begin_checkout','add_payment_info','purchase')
+  FROM raw
+  WHERE event_name IN (
+    'view_item_list',
+    'select_item',
+    'view_item',
+    'begin_checkout',
+    'add_payment_info',
+    'purchase'
+  )
 ),
 
 /* ════════════════════════ 2. VISITOR FILTERS ════════════════════════ */
 visitors AS (
-  SELECT
-      user_pseudo_id ,
-      experimentId ,
-      CASE
-        WHEN ANY_VALUE(version) IN ('Slot 1','Slot 2','Slot 3','Slot 4')  THEN 'Control'
-        WHEN ANY_VALUE(version) IN ('Slot 5','Slot 6','Slot 7','Slot 8','Slot 9','Slot 10')
-                                                                        THEN 'Test'
-        ELSE ANY_VALUE(version)
-      END                 AS Variant ,
-      ARRAY_AGG(DISTINCT Devicecategory) AS dev_arr ,
-      ARRAY_AGG(DISTINCT Brand)          AS brand_arr ,
-      MIN(event_timestamp)               AS start_ts ,
-      MAX(event_timestamp)               AS end_ts
-  FROM kpi_events
+SELECT
+    user_pseudo_id,
+    experimentId,
+
+    /* collapse Slot 1-4 → Control, 5-10 → Test */
+    CASE
+      WHEN ANY_VALUE(version) IN (
+           'Slot 1','Slot 2','Slot 3','Slot 4'
+         ) THEN 'Control'
+      WHEN ANY_VALUE(version) IN (
+           'Slot 5','Slot 6','Slot 7','Slot 8','Slot 9','Slot 10'
+         ) THEN 'Test'
+      ELSE ANY_VALUE(version)
+    END AS Variant,
+
+    /* exactly one device and one brand per user */
+    ARRAY_AGG(DISTINCT Devicecategory) AS dev_arr,
+    ARRAY_AGG(DISTINCT Brand)          AS brand_arr,
+
+    /* test window per user */
+    MIN(event_timestamp) AS start_ts,
+    MAX(event_timestamp) AS end_ts
+
+  FROM raw
   WHERE experimentId IS NOT NULL
-  GROUP BY user_pseudo_id , experimentId
-  HAVING ARRAY_LENGTH(dev_arr)=1
-     AND ARRAY_LENGTH(brand_arr)=1
-     AND Variant IN ('Control','Test')
+  GROUP BY user_pseudo_id, experimentId
+
+  HAVING
+    Variant IN ('Control','Test')
+    AND ARRAY_LENGTH(dev_arr) = 1
+    AND ARRAY_LENGTH(brand_arr) = 1
 ),
 
 valid_exp AS (      -- experiments with both variants
@@ -109,6 +128,15 @@ split_dim AS (
       STRUCT('dAll' AS tg , 'orig' AS BrandKey , NULL   AS DeviceKey),   -- Device = All  (Brand kept)
       STRUCT('totl' AS tg , NULL   AS BrandKey , NULL   AS DeviceKey)    -- Brand = All & Device = All
   ]) s
+),
+
+all_kpis AS (
+  SELECT DISTINCT kpi
+  FROM UNNEST([
+    'view_item_list','select_item','view_item',
+    'begin_checkout','add_payment_info','numberOfConversions',
+    'purchase_revenue'
+  ]) AS kpi
 ),
 
 
@@ -230,48 +258,58 @@ JOIN kpi_pivot   AS k
 /* ════════════════════════ 6.  PER-VISITOR COUNTS → STATS ════════════════════════ */
 /* ════════════════════════ 6-bis.  PER-VISITOR COUNTS → STATS  (fixed alias) ════════════════════════ */
 user_counts AS (
-  /* ----  per-visitor KPI total ----------------------------------- */
-  WITH user_kpi AS (
+  WITH user_kpi_raw AS (
+    -- sum up actual counts (same as before)
     SELECT
-        u.Brand ,
-        u.Devicecategory ,
-        u.experimentId ,
-        u.Variant ,
-        u.user_pseudo_id ,
-        k.kpi ,
-        SUM(k.kpi_val) AS kpi_cnt
-    FROM   users     AS u
-    JOIN   kpi_raw   AS k
-           ON k.user_pseudo_id = u.user_pseudo_id
-          AND k.experimentId   = u.experimentId
-    GROUP  BY u.Brand,u.Devicecategory,u.experimentId,
-             u.Variant,u.user_pseudo_id,k.kpi
+      u.Brand,
+      u.Devicecategory,
+      u.experimentId,
+      u.Variant,
+      u.user_pseudo_id,
+      k.kpi,
+      SUM(k.kpi_val) AS kpi_cnt
+    FROM users AS u
+    JOIN kpi_raw AS k
+      ON k.user_pseudo_id = u.user_pseudo_id
+     AND k.experimentId   = u.experimentId
+    GROUP BY 1,2,3,4,5,6
   )
-
-  /* ----  apply the four split views ------------------------------ */
   SELECT
-      IF(s.BrandKey  IS NULL,'All',IF(s.BrandKey  = 'orig', uk.Brand , 'All'))  AS Brand ,
-      IF(s.DeviceKey IS NULL,'All',IF(s.DeviceKey = 'orig', uk.Devicecategory , 'All')) AS Devicecategory ,
-      uk.experimentId ,
-      uk.Variant ,
-      uk.kpi ,
-      COUNT(*)                           AS n_vis ,
-      SUM(uk.kpi_cnt)                    AS sum_cnt ,
-      SUM(uk.kpi_cnt * uk.kpi_cnt)       AS sum_sq
-  FROM   user_kpi  AS uk
-  CROSS  JOIN split_dim AS s
-  GROUP  BY Brand,Devicecategory,experimentId,Variant,kpi
+    u.Brand,
+    u.Devicecategory,
+    u.experimentId,
+    u.Variant,
+    k.kpi,
+    COUNT(*)                             AS n_vis,
+    COALESCE(uk.kpi_cnt, 0)             AS sum_cnt,
+    COALESCE(uk.kpi_cnt, 0)*COALESCE(uk.kpi_cnt, 0) AS sum_sq
+  FROM users AS u
+  CROSS JOIN all_kpis AS k
+  LEFT JOIN user_kpi_raw AS uk
+    ON uk.user_pseudo_id = u.user_pseudo_id
+   AND uk.kpi            = k.kpi
+  GROUP BY u.Brand,u.Devicecategory,u.experimentId,
+           u.Variant,u.user_pseudo_id,k.kpi,uk.kpi_cnt
 ),
 
-
-stats AS (
-  SELECT
-      Brand , Devicecategory , experimentId , kpi , Variant ,
-      n_vis                                 AS n ,
-      sum_cnt / n_vis                       AS mean_kpi ,
-      GREATEST((sum_sq - sum_cnt*sum_cnt/n_vis) / NULLIF(n_vis-1,0), 0) AS var_kpi
-  FROM user_counts
-),
+ stats AS (
+   SELECT
+     Brand,
+     Devicecategory,
+     experimentId,
+     kpi,
+     Variant,
+     COUNT(*)          AS n,
+     AVG(sum_cnt)      AS mean_kpi,
+     VAR_SAMP(sum_cnt) AS var_kpi
+   FROM user_counts
+   GROUP BY
+     Brand,
+     Devicecategory,
+     experimentId,
+     kpi,
+     Variant
+ ),
 
 /* ════════════════════════ 6-bis.  TEST-STAT  (safe-divide, no ε noise) ════════════════════════ */
 /* ════════════════════════ 7-bis.  t / z on RATE difference ════════════════════════ */
