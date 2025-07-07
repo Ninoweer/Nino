@@ -1,5 +1,5 @@
 /*
-  audit_table_increments_sunweb.sql
+  audit_table_increments_rowcounts.sql
   -----------------------------------
   Purpose:  Capture full-table row counts for "yesterday" and "today"
             for every base table across all datasets in a project.
@@ -22,7 +22,7 @@
     and write to the audit dataset.
 */
 
--- ▶️ 0) DROP any existing audit objects so we start clean
+-- ▶ 0) DROP any existing audit objects so we start clean
 DROP TABLE IF EXISTS
   `{{PROJECT_ID}}.audits.table_increments`;
 DROP SCHEMA IF EXISTS
