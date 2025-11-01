@@ -1,525 +1,361 @@
--- =====================================================================
--- DISTRIBUTIONS OF PER-USER ENGAGED SESSION COUNTS (25 BINS)
--- Single unified output for sections:
---   Single_Series) Single-series 25-bin histograms (Engaged/Loyalty/Logged-in/Identified/New-user)
---   Comparisons)   Comparison 25-bin histograms (Yes/No for Logged-in/New-user/Loyalty/Identified)
---   Delta_avg)     Deltas (GroupA − GroupB) of average sessions per user
---   Score)         Scorecards (top-of-dashboard KPIs)
---
--- intent:
---   1) Work only with ENGAGED sessions for series & comparisons:
---        COALESCE(engaged_session, engaged_sessions) = TRUE
---   2) Count each session once via DISTINCT (user_pseudo_id, session_id).
---   3) Build per-user totals:
---        - Engaged sessions (all engaged)
---        - Loyalty sessions        (engaged & loyalty_card_show > 0)
---        - Logged-in sessions      (engaged & login = TRUE)
---        - Identified sessions     (engaged & identified_session = TRUE)
---        - New-user sessions       (engaged & session_date <= first_seen_date + 15 days)
---   4) Convert per-user totals (first 5 series) into 25 bins (25="25+").
---   5) Output unified table with discriminator column `section` in
---      {'Single_Series','Comparisons','Delta_avg','Score'}.
---
--- IMPORTANT on "new-user sessions"
---   We define first_seen_date as the MIN(date) for each user in the ENTIRE BASE TABLE,
---   not just the report window. This avoids classifying long-standing users as "new"
---   when the report window starts after their true first activity (left-censoring).
---
--- -------------------------
--- PARAMETERS (edit as needed)
--- -------------------------
-DECLARE report_start DATE DEFAULT DATE('2025-01-01');  -- inclusive
-DECLARE report_end   DATE DEFAULT DATE('2025-10-31');  -- inclusive
+/* =============================================================================
+   APP FEATURE USAGE — Engaged Sessions Only (BigQuery Standard SQL)
 
--- =====================================================================
--- 1) Establish each user's true first_seen_date from the entire base table
--- =====================================================================
-WITH user_first_seen AS (
+   OUTPUTS
+   1) SESSION_vs_USER_DISTRIBUTIONS_25BINS  (run the final SELECT #1)
+   2) TOP_FEATURE_TOTALS                     (run the final SELECT #2)
+
+   PURPOSE (short):
+   - Session-level histogram (0..25, 25+) per metric + % vs ALL engaged sessions.
+   - User-level histogram (per-user total usage binned, 0..25, 25+) per metric
+     + % vs ALL engaged users.
+   - Per-metric totals & user reach for the “all-metrics” page (incl. relatives).
+   - Cohort labels you can filter/split on in Looker Studio.
+
+   COHORT / COMPARISON LABELS:
+     - login_status:            'Logged In' | 'Guest'
+     - is_loyalty_session_label:'Loyalty Card Shown' | 'No Card Shown'
+     - is_new_user_15d_label:   'New User (<15d)' | 'Regular User (>15d)'
+     - user_new_low_high_bucket_label:
+         'New users' | 'Regular Single Session Users' |
+         'Regular 2/3 Sessions Users' | 'Regular Frequent Sessions (>3) Users'
+     - entry_exit_3lvl_label:   'Average Sessions' | 'First Sessions' | 'Last Sessions'
+
+   BINNING
+   - Integer bins 0..25; 25+ is grouped.
+   - Session distribution uses per-session counts.
+   - User distribution uses per-user TOTAL for that metric (sum across engaged sessions).
+
+   SAFE MATH
+   - Uses SAFE_DIVIDE to avoid division by zero.
+   ============================================================================= */
+
+/* -------------------------------
+ 0) Select engaged sessions only
+-------------------------------- */
+WITH engaged AS (
+  SELECT
+    date,
+    user_pseudo_id,
+    CAST(session_id AS INT64) AS session_id,
+    COALESCE(engaged_session, engaged_sessions) AS engaged_session,
+    identified_session,
+    login,
+    loyalty_card_show,
+
+    -- feature counters
+    promo_views, 
+    category_screens, 
+    weekdeals_screens, 
+    nextweekdeals_screens, 
+    searches,
+    plp_product_impressions, 
+    pdp_views, 
+    main_page_teasers, 
+    category_carousel_selected,
+    products_screens, 
+    moment_screens, 
+    shoppinglist_screens, 
+    myaction_screen,
+    barcodescanner_open, 
+    digital_receipt_views, 
+    loyalty_game_entries,
+    folder_opens,
+    add_to_shoppinglists, 
+    navigated, 
+    webshop_products_viewed
+  FROM `action-dwh.sandbox.ga_app_reporting_eventcount`
+  WHERE COALESCE(engaged_session, engaged_sessions) = TRUE
+),
+
+/* -------------------------------
+ 1) User stats to enable cohorts
+-------------------------------- */
+user_stats AS (
   SELECT
     user_pseudo_id,
-    MIN(date) AS first_seen_date
-  FROM `action-dwh.sandbox.ga_app_reporting_eventcount`
-  WHERE user_pseudo_id IS NOT NULL
+    MIN(date) AS first_seen_date,
+    COUNT(DISTINCT session_id) AS total_engaged_sessions_per_user,
+    COUNTIF(IFNULL(loyalty_card_show,0) > 0) AS loyalty_show_engaged_sessions_per_user
+  FROM engaged
   GROUP BY user_pseudo_id
 ),
 
--- =====================================================================
--- 2) Pull engaged sessions within the REPORT WINDOW; normalize types; add flags
--- =====================================================================
-engaged_sessions AS (
-  SELECT DISTINCT
-    s.user_pseudo_id,
-    SAFE_CAST(s.session_id AS INT64) AS session_id,
-    s.date AS session_date,
-
-    -- Normalize per-session flags; NULL -> safe defaults.
-    IFNULL(s.login, FALSE)               AS is_logged_in,
-    IFNULL(s.identified_session, FALSE)  AS is_identified,
-    (IFNULL(s.loyalty_card_show, 0) > 0) AS has_loyalty
-  FROM `action-dwh.sandbox.ga_app_reporting_eventcount` AS s
-  WHERE
-    s.date BETWEEN report_start AND report_end                            -- report window
-    AND COALESCE(s.engaged_session, s.engaged_sessions) = TRUE            -- engaged only
-    AND s.user_pseudo_id IS NOT NULL
-    AND SAFE_CAST(s.session_id AS INT64) IS NOT NULL                      -- must have valid session key
+/* -------------------------------------------------------------
+ 2) Order sessions to flag first / last (among engaged sessions)
+-------------------------------------------------------------- */
+with_ord AS (
+  SELECT
+    e.*,
+    us.first_seen_date,
+    us.total_engaged_sessions_per_user,
+    us.loyalty_show_engaged_sessions_per_user,
+    ROW_NUMBER() OVER (PARTITION BY e.user_pseudo_id ORDER BY e.date, e.session_id) AS rn_asc,
+    ROW_NUMBER() OVER (PARTITION BY e.user_pseudo_id ORDER BY e.date DESC, e.session_id DESC) AS rn_desc
+  FROM engaged e
+  JOIN user_stats us USING (user_pseudo_id)
 ),
 
--- =====================================================================
--- 3) Attach first_seen_date and compute new-user-at-session flag
---    Definition: session is "new-user" if session_date <= first_seen_date + 15 days
--- =====================================================================
-engaged_with_lifecycle AS (
+/* -------------------------------------------------------------
+ 3) Cohort flags + human-friendly labels for Looker Studio
+-------------------------------------------------------------- */
+with_flags AS (
   SELECT
-    e.user_pseudo_id,
-    e.session_id,
-    e.session_date,
-    e.is_logged_in,
-    e.is_identified,
-    e.has_loyalty,
-    ufs.first_seen_date,
+    *,
+    -- Logged in?
+    (IFNULL(identified_session,FALSE) OR IFNULL(login,FALSE)) AS is_logged_in,
+
+    -- Loyalty in session (boolean + label)
+    IF(IFNULL(loyalty_card_show,0) > 0, TRUE, FALSE) AS is_loyalty_session,
+    CASE WHEN IFNULL(loyalty_card_show,0) > 0
+         THEN 'Loyalty Card Shown' ELSE 'No Card Shown' END AS is_loyalty_session_label,
+
+    -- New vs regular (by first_seen_date)
+    DATE_DIFF(date, first_seen_date, DAY) AS days_since_first_seen,
+    CASE WHEN DATE_DIFF(date, first_seen_date, DAY) < 15 THEN TRUE ELSE FALSE END AS is_new_user_15d,
+    CASE WHEN DATE_DIFF(date, first_seen_date, DAY) < 15
+         THEN 'New User (<15d)' ELSE 'Regular User (>15d)' END AS is_new_user_15d_label,
+
+    -- 4-way tenure bucket
     CASE
-      WHEN e.session_date <= DATE_ADD(ufs.first_seen_date, INTERVAL 15 DAY)
-      THEN TRUE ELSE FALSE
-    END AS is_new_user_session
-  FROM engaged_sessions AS e
-  JOIN user_first_seen AS ufs
-    ON ufs.user_pseudo_id = e.user_pseudo_id
+      WHEN DATE_DIFF(date, first_seen_date, DAY) < 15                            THEN 'New users'
+      WHEN total_engaged_sessions_per_user = 1                                    THEN 'Regular Single Session Users'
+      WHEN total_engaged_sessions_per_user BETWEEN 2 AND 3                        THEN 'Regular 2/3 Sessions Users'
+      WHEN total_engaged_sessions_per_user > 3                                    THEN 'Regular Frequent Sessions (>3) Users'
+    END AS user_new_low_high_bucket_label,
+
+    -- Entry / Exit / Average Sessions (chart label)
+    CASE
+      WHEN total_engaged_sessions_per_user > 1 AND rn_asc  = 1 THEN 'First Sessions'
+      WHEN total_engaged_sessions_per_user > 1 AND rn_desc = 1 THEN 'Last Sessions'
+      ELSE 'Average Sessions'
+    END AS entry_exit_3lvl_label,
+
+    -- Login status label
+    CASE WHEN (IFNULL(identified_session,FALSE) OR IFNULL(login,FALSE))
+         THEN 'Logged In' ELSE 'Guest' END AS login_status
+  FROM with_ord
 ),
 
--- =====================================================================
--- 4) Per-user totals across engaged sessions (in-window)
--- =====================================================================
-per_user AS (
+/* -------------------------------------------------------------
+ 4) Long shape (session × metric_name, metric_value)
+    — UNNEST keeps one scan and is easy to maintain
+-------------------------------------------------------------- */
+session_long AS (
   SELECT
+    s.date,
+    s.user_pseudo_id,
+    s.session_id,
+
+    -- labels usable as breakdown/filters
+    s.login_status,
+    s.is_loyalty_session,
+    s.is_loyalty_session_label,
+    s.is_new_user_15d,
+    s.is_new_user_15d_label,
+    s.user_new_low_high_bucket_label,
+    s.entry_exit_3lvl_label,
+
+    m.metric_name,
+    m.metric_value
+  FROM with_flags s,
+  UNNEST([
+    STRUCT('promo_views'                AS metric_name, CAST(IFNULL(promo_views,0)                AS INT64) AS metric_value),
+    STRUCT('category_screens'           AS metric_name, CAST(IFNULL(category_screens,0)           AS INT64) AS metric_value),
+    STRUCT('weekdeals_screens'          AS metric_name, CAST(IFNULL(weekdeals_screens,0)          AS INT64) AS metric_value),
+    STRUCT('nextweekdeals_screens'      AS metric_name, CAST(IFNULL(nextweekdeals_screens,0)      AS INT64) AS metric_value),
+    STRUCT('searches'                   AS metric_name, CAST(IFNULL(searches,0)                   AS INT64) AS metric_value),
+    STRUCT('plp_product_impressions'    AS metric_name, CAST(IFNULL(plp_product_impressions,0)    AS INT64) AS metric_value),
+    STRUCT('pdp_views'                  AS metric_name, CAST(IFNULL(pdp_views,0)                  AS INT64) AS metric_value),
+    STRUCT('main_page_teasers'          AS metric_name, CAST(IFNULL(main_page_teasers,0)          AS INT64) AS metric_value),
+    STRUCT('category_carousel_selected' AS metric_name, CAST(IFNULL(category_carousel_selected,0) AS INT64) AS metric_value),
+    STRUCT('products_screens'           AS metric_name, CAST(IFNULL(products_screens,0)           AS INT64) AS metric_value),
+    STRUCT('moment_screens'             AS metric_name, CAST(IFNULL(moment_screens,0)             AS INT64) AS metric_value),
+    STRUCT('shoppinglist_screens'       AS metric_name, CAST(IFNULL(shoppinglist_screens,0)       AS INT64) AS metric_value),
+    STRUCT('myaction_screen'            AS metric_name, CAST(IFNULL(myaction_screen,0)            AS INT64) AS metric_value),
+    STRUCT('barcodescanner_open'        AS metric_name, CAST(IFNULL(barcodescanner_open,0)        AS INT64) AS metric_value),
+    STRUCT('loyalty_card_show'          AS metric_name, CAST(IFNULL(loyalty_card_show,0)          AS INT64) AS metric_value),
+    STRUCT('digital_receipt_views'      AS metric_name, CAST(IFNULL(digital_receipt_views,0)      AS INT64) AS metric_value),
+    STRUCT('loyalty_game_entries'       AS metric_name, CAST(IFNULL(loyalty_game_entries,0)       AS INT64) AS metric_value),
+    STRUCT('folder_opens'               AS metric_name, CAST(IFNULL(folder_opens,0)               AS INT64) AS metric_value),
+    STRUCT('add_to_shoppinglists'       AS metric_name, CAST(IFNULL(add_to_shoppinglists,0)       AS INT64) AS metric_value),
+    STRUCT('navigated'                  AS metric_name, CAST(IFNULL(navigated,0)                  AS INT64) AS metric_value),
+    STRUCT('webshop_products_viewed'    AS metric_name, CAST(IFNULL(webshop_products_viewed,0)    AS INT64) AS metric_value)
+  ]) AS m
+),
+
+/* -------------------------------------------------------------
+ 5) Global denominators for requested relative metrics
+-------------------------------------------------------------- */
+global_denoms AS (
+  SELECT
+    COUNT(DISTINCT session_id) AS all_unique_sessions,
+    COUNT(DISTINCT user_pseudo_id) AS all_unique_users,
+    SUM(metric_value) AS all_metrics_event_count
+  FROM session_long
+),
+
+/* -------------------------------------------------------------
+ 6) Session-level binning (0..25, 25+)
+-------------------------------------------------------------- */
+session_binned AS (
+  SELECT
+    metric_name,
+    CAST(LEAST(ROUND(CAST(metric_value AS FLOAT64)), 25) AS INT64) AS bin_numeric_0_25,
+    IF(ROUND(CAST(metric_value AS FLOAT64)) >= 25, '25+', CAST(ROUND(CAST(metric_value AS FLOAT64)) AS STRING)) AS bin_label_0_25,
+    session_id,
+
+    -- keep labels for filtering/splitting in charts
+    login_status,
+    is_loyalty_session_label,
+    is_new_user_15d_label,
+    user_new_low_high_bucket_label,
+    entry_exit_3lvl_label
+  FROM session_long
+),
+
+/* -------------------------------------------------------------
+ 7) User-level totals per metric (sum across engaged sessions),
+    then bin (0..25, 25+)
+    - We exclude users with total==0 from the histogram,
+      but use ALL engaged users as denominator for % (as requested).
+-------------------------------------------------------------- */
+user_metric_totals AS (
+  SELECT
+    metric_name,
+    user_pseudo_id,
+    SUM(metric_value) AS user_total_for_metric,
+
+    -- Note: these per-user labels are taken arbitrarily from their sessions (for filtering convenience).
+    ANY_VALUE(login_status)                   AS login_status,
+    ANY_VALUE(is_loyalty_session_label)       AS is_loyalty_session_label,
+    ANY_VALUE(is_new_user_15d_label)          AS is_new_user_15d_label,
+    ANY_VALUE(user_new_low_high_bucket_label) AS user_new_low_high_bucket_label
+  FROM session_long
+  GROUP BY metric_name, user_pseudo_id
+),
+user_binned AS (
+  SELECT
+    metric_name,
+    CAST(LEAST(ROUND(CAST(user_total_for_metric AS FLOAT64)), 25) AS INT64) AS bin_numeric_0_25,
+    IF(ROUND(CAST(user_total_for_metric AS FLOAT64)) >= 25, '25+', CAST(ROUND(CAST(user_total_for_metric AS FLOAT64)) AS STRING)) AS bin_label_0_25,
     user_pseudo_id,
 
-    -- Explicit COUNT of DISTINCT sessions to avoid ambiguity
-    COUNT(DISTINCT session_id)                                       AS engaged_sessions,
-
-    COUNT(DISTINCT IF(has_loyalty,           session_id, NULL))      AS loyalty_sessions,
-    COUNT(DISTINCT IF(is_logged_in,          session_id, NULL))      AS logged_in_sessions,
-    COUNT(DISTINCT IF(is_identified,         session_id, NULL))      AS identified_sessions,
-
-    -- NEW-USER definition by lifecycle window (15 days from true first_seen_date)
-    COUNT(DISTINCT IF(is_new_user_session,   session_id, NULL))      AS new_user_sessions
-  FROM engaged_with_lifecycle
-  GROUP BY user_pseudo_id
+    login_status,
+    is_loyalty_session_label,
+    is_new_user_15d_label,
+    user_new_low_high_bucket_label
+  FROM user_metric_totals
+  WHERE user_total_for_metric > 0  -- “users that clicked the metric”
 ),
 
--- =====================================================================
--- 5) Single-series 25-bin histograms (Single_Series)
--- =====================================================================
-long_user_series AS (
-  SELECT user_pseudo_id, 'Engaged Sessions'      AS series, engaged_sessions      AS session_count FROM per_user UNION ALL
-  SELECT user_pseudo_id, 'Loyalty Sessions'      AS series, loyalty_sessions      AS session_count FROM per_user UNION ALL
-  SELECT user_pseudo_id, 'Logged-in Sessions'    AS series, logged_in_sessions    AS session_count FROM per_user UNION ALL
-  SELECT user_pseudo_id, 'Identified Sessions'   AS series, identified_sessions   AS session_count FROM per_user UNION ALL
-  SELECT user_pseudo_id, 'New-user Sessions'     AS series, new_user_sessions     AS session_count FROM per_user
-),
-nonzero AS (
-  SELECT series, user_pseudo_id, session_count
-  FROM long_user_series
-  WHERE session_count > 0
-),
-bucketed AS (
+/* -------------------------------------------------------------
+ 8) Totals per metric for the TOP_FEATURES page
+-------------------------------------------------------------- */
+metric_totals AS (
   SELECT
-    series,
-    user_pseudo_id,
-    LEAST(session_count, 25) AS session_bucket
-  FROM nonzero
+    sl.metric_name,
+    SUM(sl.metric_value) AS total_usage_count,
+    -- BigQuery: use conditional DISTINCT instead of FILTER syntax
+    COUNT(DISTINCT IF(sl.metric_value > 0, sl.user_pseudo_id, NULL)) AS users_clicking_metric
+  FROM session_long sl
+  GROUP BY sl.metric_name
 ),
-freq AS (
+metric_totals_with_rel AS (
   SELECT
-    series,
-    session_bucket,
-    COUNT(DISTINCT user_pseudo_id) AS users
-  FROM bucketed
-  GROUP BY series, session_bucket
-),
-final_bins AS (
-  SELECT
-    f.series,
-    f.session_bucket,
-    CASE WHEN f.session_bucket = 25 THEN '25+' ELSE CAST(f.session_bucket AS STRING) END AS bucket_label,
-    f.users,
-    SAFE_DIVIDE(
-      f.users,
-      NULLIF(SUM(f.users) OVER (PARTITION BY f.series), 0)
-    ) AS users_pct_users
-  FROM freq AS f
-),
-
--- =====================================================================
--- 6) Comparison 25-bin histograms (Comparisons):
---     Groups and labels standardized across the pipeline.
---     Dimensions:
---       * 'Logged_vs_Guest'      : groups {'Logged in','Guest'}
---       * 'New_vs_Recurring'     : groups {'New User','Recurring'}
---       * 'Loyalty_vs_NoCard'    : groups {'Loyalty Card Shown','No Card Shown'}
---       * 'Identified_vs_Anonymous': groups {'Identified','Anonymous'}
--- =====================================================================
-per_user_by_group AS (
-  -- Logged vs Guest
-  SELECT user_pseudo_id, 'Logged_vs_Guest' AS comparison_dimension, 'Logged in' AS comparison_group,
-         COUNT(DISTINCT IF(is_logged_in,        session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-  UNION ALL
-  SELECT user_pseudo_id, 'Logged_vs_Guest', 'Guest',
-         COUNT(DISTINCT IF(NOT is_logged_in,    session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-
-  UNION ALL
-  -- New vs Recurring
-  SELECT user_pseudo_id, 'New_vs_Recurring', 'New User',
-         COUNT(DISTINCT IF(is_new_user_session, session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-  UNION ALL
-  SELECT user_pseudo_id, 'New_vs_Recurring', 'Recurring',
-         COUNT(DISTINCT IF(NOT is_new_user_session, session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-
-  UNION ALL
-  -- Loyalty vs No Card
-  SELECT user_pseudo_id, 'Loyalty_vs_NoCard', 'Loyalty Card Shown',
-         COUNT(DISTINCT IF(has_loyalty,         session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-  UNION ALL
-  SELECT user_pseudo_id, 'Loyalty_vs_NoCard', 'No Card Shown',
-         COUNT(DISTINCT IF(NOT has_loyalty,     session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-
-  UNION ALL
-  -- Identified vs Anonymous
-  SELECT user_pseudo_id, 'Identified_vs_Anonymous', 'Identified',
-         COUNT(DISTINCT IF(is_identified,       session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-  UNION ALL
-  SELECT user_pseudo_id, 'Identified_vs_Anonymous', 'Anonymous',
-         COUNT(DISTINCT IF(NOT is_identified,   session_id, NULL)) AS session_count
-  FROM engaged_with_lifecycle GROUP BY user_pseudo_id
-),
-per_user_by_group_nonzero AS (
-  SELECT * FROM per_user_by_group WHERE session_count > 0
-),
-per_user_by_group_bucketed AS (
-  SELECT
-    comparison_dimension,
-    comparison_group,
-    user_pseudo_id,
-    LEAST(session_count, 25) AS session_bucket
-  FROM per_user_by_group_nonzero
-),
-comparison_bins AS (
-  SELECT
-    comparison_dimension,
-    comparison_group,
-    session_bucket,
-    COUNT(DISTINCT user_pseudo_id) AS users
-  FROM per_user_by_group_bucketed
-  GROUP BY comparison_dimension, comparison_group, session_bucket
-),
-final_comparison_bins AS (
-  SELECT
-    comparison_dimension,
-    comparison_group,
-    session_bucket,
-    CASE WHEN session_bucket = 25 THEN '25+' ELSE CAST(session_bucket AS STRING) END AS bucket_label,
-    users,
-    SAFE_DIVIDE(
-      users,
-      NULLIF(SUM(users) OVER (PARTITION BY comparison_dimension, comparison_group), 0)
-    ) AS users_pct_users
-  FROM comparison_bins
-),
-
--- =====================================================================
--- 7) Deltas (Delta_avg): average sessions per user in each group + (GroupA − GroupB)
---     We define GroupA and GroupB explicitly per dimension to ensure consistent deltas:
---       Logged_vs_Guest      : 'Logged in'       − 'Guest'
---       New_vs_Recurring     : 'New User'        − 'Recurring'
---       Loyalty_vs_NoCard    : 'Loyalty Card Shown' − 'No Card Shown'
---       Identified_vs_Anonymous: 'Identified'    − 'Anonymous'
--- =====================================================================
-group_averages AS (
-  SELECT
-    comparison_dimension,
-    comparison_group,
-    AVG(session_count) AS avg_sessions_per_user,
-    COUNT(DISTINCT user_pseudo_id) AS users_in_group
-  FROM per_user_by_group_nonzero
-  GROUP BY comparison_dimension, comparison_group
-),
--- helper mapping for A/B group names per dimension
-dim_pairs AS (
-  SELECT 'Logged_vs_Guest' AS comparison_dimension, 'Logged in' AS group_a, 'Guest' AS group_b UNION ALL
-  SELECT 'New_vs_Recurring', 'New User', 'Recurring' UNION ALL
-  SELECT 'Loyalty_vs_NoCard', 'Loyalty Card Shown', 'No Card Shown' UNION ALL
-  SELECT 'Identified_vs_Anonymous', 'Identified', 'Anonymous'
-),
-comparison_deltas AS (
-  SELECT
-    p.comparison_dimension,
-    a.avg_sessions_per_user AS avg_sessions_group_a,
-    b.avg_sessions_per_user AS avg_sessions_group_b,
-    SAFE_SUBTRACT(a.avg_sessions_per_user, b.avg_sessions_per_user) AS delta_group_a_minus_b,
-    a.users_in_group AS users_in_group_a,
-    b.users_in_group AS users_in_group_b,
-    p.group_a,
-    p.group_b
-  FROM dim_pairs p
-  LEFT JOIN group_averages a
-    ON a.comparison_dimension = p.comparison_dimension
-   AND a.comparison_group     = p.group_a
-  LEFT JOIN group_averages b
-    ON b.comparison_dimension = p.comparison_dimension
-   AND b.comparison_group     = p.group_b
-),
-
--- =====================================================================
--- 8) Scorecards (Score): totals & percentages
--- =====================================================================
-all_sessions_in_window AS (
-  SELECT DISTINCT
-    user_pseudo_id,
-    SAFE_CAST(session_id AS INT64) AS session_id,
-    date AS session_date
-  FROM `action-dwh.sandbox.ga_app_reporting_eventcount`
-  WHERE
-    date BETWEEN report_start AND report_end
-    AND user_pseudo_id IS NOT NULL
-    AND SAFE_CAST(session_id AS INT64) IS NOT NULL
-),
-engaged_totals AS (
-  SELECT
-    COUNT(DISTINCT session_id) AS engaged_sessions_total,
-    COUNT(DISTINCT IF(is_logged_in,        session_id, NULL)) AS logged_in_sessions_total,
-    COUNT(DISTINCT IF(is_identified,       session_id, NULL)) AS identified_sessions_total,
-    COUNT(DISTINCT IF(has_loyalty,         session_id, NULL)) AS loyalty_sessions_total,
-    COUNT(DISTINCT IF(is_new_user_session, session_id, NULL)) AS new_user_sessions_total
-  FROM engaged_with_lifecycle
-),
-engaged_user_flags AS (
-  SELECT
-    user_pseudo_id,
-    MIN(session_date) AS first_engaged_in_window,
-    ANY_VALUE(first_seen_date) AS first_seen_date
-  FROM engaged_with_lifecycle
-  GROUP BY user_pseudo_id
-),
-engaged_user_breakdown AS (
-  SELECT
-    COUNT(DISTINCT user_pseudo_id) AS engaged_users_total,
-    COUNT(DISTINCT IF(first_engaged_in_window <= DATE_ADD(first_seen_date, INTERVAL 15 DAY),
-                      user_pseudo_id, NULL)) AS engaged_users_new,
-    COUNT(DISTINCT IF(first_engaged_in_window  > DATE_ADD(first_seen_date, INTERVAL 15 DAY),
-                      user_pseudo_id, NULL)) AS engaged_users_recurring
-  FROM engaged_user_flags
-),
-scorecards AS (
-  SELECT
-    -- Session totals
-    (SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window)        AS all_sessions_total,
-    (SELECT engaged_sessions_total            FROM engaged_totals)          AS engaged_sessions_total,
-    SAFE_DIVIDE(
-      (SELECT engaged_sessions_total FROM engaged_totals),
-      NULLIF((SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window),0)
-    ) AS engaged_sessions_pct_of_all,
-
-    -- User totals (based on engaged)
-    (SELECT engaged_users_total    FROM engaged_user_breakdown)            AS engaged_users_total,
-    (SELECT engaged_users_new      FROM engaged_user_breakdown)            AS engaged_users_new,
-    (SELECT engaged_users_recurring FROM engaged_user_breakdown)           AS engaged_users_recurring,
-    SAFE_DIVIDE(
-      (SELECT engaged_users_new FROM engaged_user_breakdown),
-      NULLIF((SELECT engaged_users_total FROM engaged_user_breakdown),0)
-    ) AS engaged_users_new_pct,
-    SAFE_DIVIDE(
-      (SELECT engaged_users_recurring FROM engaged_user_breakdown),
-      NULLIF((SELECT engaged_users_total FROM engaged_user_breakdown),0)
-    ) AS engaged_users_recurring_pct,
-
-    -- Flagged engaged session totals and their % of ENGAGED and % of ALL
-    (SELECT loyalty_sessions_total   FROM engaged_totals)                  AS loyalty_sessions_total,
-    (SELECT identified_sessions_total FROM engaged_totals)                 AS identified_sessions_total,
-    (SELECT logged_in_sessions_total FROM engaged_totals)                  AS logged_in_sessions_total,
-    (SELECT new_user_sessions_total  FROM engaged_totals)                  AS new_user_sessions_total,
-
-    SAFE_DIVIDE((SELECT loyalty_sessions_total   FROM engaged_totals),
-                NULLIF((SELECT engaged_sessions_total FROM engaged_totals),0)) AS loyalty_sessions_pct_of_engaged,
-    SAFE_DIVIDE((SELECT identified_sessions_total FROM engaged_totals),
-                NULLIF((SELECT engaged_sessions_total FROM engaged_totals),0)) AS identified_sessions_pct_of_engaged,
-    SAFE_DIVIDE((SELECT logged_in_sessions_total FROM engaged_totals),
-                NULLIF((SELECT engaged_sessions_total FROM engaged_totals),0)) AS logged_in_sessions_pct_of_engaged,
-    SAFE_DIVIDE((SELECT new_user_sessions_total  FROM engaged_totals),
-                NULLIF((SELECT engaged_sessions_total FROM engaged_totals),0)) AS new_user_sessions_pct_of_engaged,
-
-    SAFE_DIVIDE((SELECT loyalty_sessions_total   FROM engaged_totals),
-                NULLIF((SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window),0)) AS loyalty_sessions_pct_of_all,
-    SAFE_DIVIDE((SELECT identified_sessions_total FROM engaged_totals),
-                NULLIF((SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window),0)) AS identified_sessions_pct_of_all,
-    SAFE_DIVIDE((SELECT logged_in_sessions_total FROM engaged_totals),
-                NULLIF((SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window),0)) AS logged_in_sessions_pct_of_all,
-    SAFE_DIVIDE((SELECT new_user_sessions_total  FROM engaged_totals),
-                NULLIF((SELECT COUNT(DISTINCT session_id) FROM all_sessions_in_window),0)) AS new_user_sessions_pct_of_all
+    mt.metric_name,
+    mt.total_usage_count,
+    SAFE_DIVIDE(mt.total_usage_count, gd.all_metrics_event_count) AS relative_usage_count_pct,
+    mt.users_clicking_metric,
+    SAFE_DIVIDE(mt.users_clicking_metric, gd.all_unique_users)     AS relative_users_clicking_pct
+  FROM metric_totals mt
+  CROSS JOIN global_denoms gd
 )
 
--- =====================================================================
--- 9) UNIFIED OUTPUT (Single_Series + Comparisons + Delta_avg + Score) — single table
---     Common schema with discriminator column `section`.
---     Non-applicable fields are NULL by design.
--- =====================================================================
+/* =====================================================================
+   FINAL SELECT #1 — SESSION_vs_USER_DISTRIBUTIONS_25BINS
+   One long table with a `distribution_level` column:
+     'session' rows:   counts & percentages vs ALL unique engaged sessions
+     'user' rows:      counts & percentages vs ALL unique engaged users
+   Use filters on the label columns to build each comparison page.
+===================================================================== */
+-- SESSION distribution
 SELECT
-  'Single_Series' AS section,            -- Single-series 25-bin histograms
-  NULL AS comparison_dimension,          -- not used in Single_Series
-  NULL AS comparison_group,              -- not used in Single_Series
-  series,
-  session_bucket,
-  bucket_label,
-  users,
-  users_pct_users,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_a,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_b,
-  CAST(NULL AS FLOAT64) AS delta_group_a_minus_b,
-  CAST(NULL AS INT64)   AS users_in_group_a,
-  CAST(NULL AS INT64)   AS users_in_group_b,
-  CAST(NULL AS STRING)  AS group_a_label,
-  CAST(NULL AS STRING)  AS group_b_label,
-  CAST(NULL AS INT64)   AS all_sessions_total,
-  CAST(NULL AS INT64)   AS engaged_sessions_total,
-  CAST(NULL AS FLOAT64) AS engaged_sessions_pct_of_all,
-  CAST(NULL AS INT64)   AS engaged_users_total,
-  CAST(NULL AS INT64)   AS engaged_users_new,
-  CAST(NULL AS INT64)   AS engaged_users_recurring,
-  CAST(NULL AS FLOAT64) AS engaged_users_new_pct,
-  CAST(NULL AS FLOAT64) AS engaged_users_recurring_pct,
-  CAST(NULL AS INT64)   AS loyalty_sessions_total,
-  CAST(NULL AS INT64)   AS identified_sessions_total,
-  CAST(NULL AS INT64)   AS logged_in_sessions_total,
-  CAST(NULL AS INT64)   AS new_user_sessions_total,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_all
-FROM final_bins
+  'session' AS distribution_level,                 -- <- use this for a legend or a parameter
+  b.metric_name,
+  b.bin_numeric_0_25,
+  b.bin_label_0_25,
+
+  b.login_status,
+  b.is_loyalty_session_label,
+  b.is_new_user_15d_label,
+  b.user_new_low_high_bucket_label,
+  b.entry_exit_3lvl_label,
+
+  COUNT(DISTINCT b.session_id) AS count_in_bin,
+  SAFE_DIVIDE(COUNT(DISTINCT b.session_id), gd.all_unique_sessions) AS pct_of_all_unique_sessions,
+
+  -- optional within-feature percentage (bins sum to 100% per metric)
+  SAFE_DIVIDE(
+    COUNT(DISTINCT b.session_id),
+    SUM(COUNT(DISTINCT b.session_id)) OVER (PARTITION BY b.metric_name)
+  ) AS pct_of_sessions_within_feature
+
+FROM session_binned b
+CROSS JOIN global_denoms gd
+GROUP BY
+  b.metric_name, b.bin_numeric_0_25, b.bin_label_0_25,
+  b.login_status, b.is_loyalty_session_label, b.is_new_user_15d_label,
+  b.user_new_low_high_bucket_label, b.entry_exit_3lvl_label, gd.all_unique_sessions
 
 UNION ALL
-SELECT
-  'Comparisons' AS section,              -- Comparison 25-bin histograms
-  comparison_dimension,
-  comparison_group,
-  NULL AS series,
-  session_bucket,
-  bucket_label,
-  users,
-  users_pct_users,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_a,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_b,
-  CAST(NULL AS FLOAT64) AS delta_group_a_minus_b,
-  CAST(NULL AS INT64)   AS users_in_group_a,
-  CAST(NULL AS INT64)   AS users_in_group_b,
-  CAST(NULL AS STRING)  AS group_a_label,
-  CAST(NULL AS STRING)  AS group_b_label,
-  CAST(NULL AS INT64)   AS all_sessions_total,
-  CAST(NULL AS INT64)   AS engaged_sessions_total,
-  CAST(NULL AS FLOAT64) AS engaged_sessions_pct_of_all,
-  CAST(NULL AS INT64)   AS engaged_users_total,
-  CAST(NULL AS INT64)   AS engaged_users_new,
-  CAST(NULL AS INT64)   AS engaged_users_recurring,
-  CAST(NULL AS FLOAT64) AS engaged_users_new_pct,
-  CAST(NULL AS FLOAT64) AS engaged_users_recurring_pct,
-  CAST(NULL AS INT64)   AS loyalty_sessions_total,
-  CAST(NULL AS INT64)   AS identified_sessions_total,
-  CAST(NULL AS INT64)   AS logged_in_sessions_total,
-  CAST(NULL AS INT64)   AS new_user_sessions_total,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_all
-FROM final_comparison_bins
 
-UNION ALL
+-- USER distribution (per-user total usage binned; relative vs ALL engaged users)
 SELECT
-  'Delta_avg' AS section,                -- Deltas (GroupA − GroupB)
-  comparison_dimension,
-  NULL AS comparison_group,
-  NULL AS series,
-  NULL AS session_bucket,
-  NULL AS bucket_label,
-  CAST(NULL AS INT64)   AS users,
-  CAST(NULL AS FLOAT64) AS users_pct_users,
-  avg_sessions_group_a,
-  avg_sessions_group_b,
-  delta_group_a_minus_b,
-  users_in_group_a,
-  users_in_group_b,
-  group_a AS group_a_label,
-  group_b AS group_b_label,
-  CAST(NULL AS INT64)   AS all_sessions_total,
-  CAST(NULL AS INT64)   AS engaged_sessions_total,
-  CAST(NULL AS FLOAT64) AS engaged_sessions_pct_of_all,
-  CAST(NULL AS INT64)   AS engaged_users_total,
-  CAST(NULL AS INT64)   AS engaged_users_new,
-  CAST(NULL AS INT64)   AS engaged_users_recurring,
-  CAST(NULL AS FLOAT64) AS engaged_users_new_pct,
-  CAST(NULL AS FLOAT64) AS engaged_users_recurring_pct,
-  CAST(NULL AS INT64)   AS loyalty_sessions_total,
-  CAST(NULL AS INT64)   AS identified_sessions_total,
-  CAST(NULL AS INT64)   AS logged_in_sessions_total,
-  CAST(NULL AS INT64)   AS new_user_sessions_total,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_engaged,
-  CAST(NULL AS FLOAT64) AS loyalty_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS identified_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS logged_in_sessions_pct_of_all,
-  CAST(NULL AS FLOAT64) AS new_user_sessions_pct_of_all
-FROM comparison_deltas
+  'user' AS distribution_level,
+  u.metric_name,
+  u.bin_numeric_0_25,
+  u.bin_label_0_25,
 
-UNION ALL
+  u.login_status,
+  u.is_loyalty_session_label,
+  u.is_new_user_15d_label,
+  u.user_new_low_high_bucket_label,
+  CAST(NULL AS STRING) AS entry_exit_3lvl_label,  -- not meaningful at user grain
+
+  COUNT(DISTINCT u.user_pseudo_id) AS count_in_bin,
+  SAFE_DIVIDE(COUNT(DISTINCT u.user_pseudo_id), gd.all_unique_users) AS pct_of_all_unique_users,
+
+  -- optional within-feature percentage (bins sum to 100% per metric)
+  SAFE_DIVIDE(
+    COUNT(DISTINCT u.user_pseudo_id),
+    SUM(COUNT(DISTINCT u.user_pseudo_id)) OVER (PARTITION BY u.metric_name)
+  ) AS pct_of_users_within_feature
+
+FROM user_binned u
+CROSS JOIN global_denoms gd
+GROUP BY
+  u.metric_name, u.bin_numeric_0_25, u.bin_label_0_25,
+  u.login_status, u.is_loyalty_session_label, u.is_new_user_15d_label,
+  u.user_new_low_high_bucket_label, gd.all_unique_users
+ORDER BY metric_name, distribution_level, bin_numeric_0_25
+;
+
+/* =====================================================================
+   FINAL SELECT #2 — TOP_FEATURE_TOTALS
+   Per-metric totals for the "all-metrics" page (one row per metric).
+   Filter this table in LS using label columns if you duplicate data
+   sources with WHEREs (this base output is overall totals).
+===================================================================== */
 SELECT
-  'Score' AS section,                    -- Scorecards (single row)
-  NULL AS comparison_dimension,
-  NULL AS comparison_group,
-  NULL AS series,
-  NULL AS session_bucket,
-  NULL AS bucket_label,
-  CAST(NULL AS INT64)   AS users,
-  CAST(NULL AS FLOAT64) AS users_pct_users,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_a,
-  CAST(NULL AS FLOAT64) AS avg_sessions_group_b,
-  CAST(NULL AS FLOAT64) AS delta_group_a_minus_b,
-  CAST(NULL AS INT64)   AS users_in_group_a,
-  CAST(NULL AS INT64)   AS users_in_group_b,
-  CAST(NULL AS STRING)  AS group_a_label,
-  CAST(NULL AS STRING)  AS group_b_label,
-  all_sessions_total,
-  engaged_sessions_total,
-  engaged_sessions_pct_of_all,
-  engaged_users_total,
-  engaged_users_new,
-  engaged_users_recurring,
-  engaged_users_new_pct,
-  engaged_users_recurring_pct,
-  loyalty_sessions_total,
-  identified_sessions_total,
-  logged_in_sessions_total,
-  new_user_sessions_total,
-  loyalty_sessions_pct_of_engaged,
-  identified_sessions_pct_of_engaged,
-  logged_in_sessions_pct_of_engaged,
-  new_user_sessions_pct_of_engaged,
-  loyalty_sessions_pct_of_all,
-  identified_sessions_pct_of_all,
-  logged_in_sessions_pct_of_all,
-  new_user_sessions_pct_of_all
-FROM scorecards
+  mtr.metric_name,
+
+  -- Totals & relative shares (exactly as requested)
+  mtr.total_usage_count,
+  mtr.relative_usage_count_pct,         -- vs sum across all metrics
+  mtr.users_clicking_metric,
+  mtr.relative_users_clicking_pct       -- vs ALL unique engaged users
+
+FROM metric_totals_with_rel mtr
+ORDER BY mtr.metric_name
 ;
