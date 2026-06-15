@@ -8,9 +8,9 @@
 --   One row per current_channel x next_channel pair, excluding same-channel and PURCHASE.
 --   Includes zero-probability pairs so Looker can show a complete channel-by-channel matrix.
 --
--- Interpretation:
---   Descriptive observed next-channel behavior in converting journeys.
---   Not causal optimization and not budget advice.
+-- Important:
+--   Do NOT add ORDER BY to the final CTAS SELECT. This table is clustered.
+--   Use ORDER BY when querying the completed table.
 
 DECLARE reporting_start_date DATE DEFAULT DATE '2026-05-28';
 DECLARE reporting_end_date   DATE DEFAULT DATE '2026-06-10';
@@ -80,36 +80,49 @@ touch_ordered AS (
     *,
     ROW_NUMBER() OVER (
       PARTITION BY journey_id
-      ORDER BY session_date, COALESCE(ga_session_id_int, 9223372036854775807), ga_session_id
+      ORDER BY
+        session_date,
+        COALESCE(ga_session_id_int, 9223372036854775807),
+        ga_session_id
     ) AS raw_position
   FROM touch_raw
 ),
 
--- Collapse consecutive identical channels so repeated same-channel sessions do not
--- inflate transition probabilities.
+-- Collapse consecutive identical channels so repeated same-channel sessions do
+-- not inflate transition probabilities.
 lagged AS (
   SELECT
     *,
-    LAG(channel) OVER (PARTITION BY journey_id ORDER BY raw_position) AS previous_channel
+    LAG(channel) OVER (
+      PARTITION BY journey_id
+      ORDER BY raw_position
+    ) AS previous_channel
   FROM touch_ordered
 ),
 
 collapsed AS (
   SELECT *
   FROM lagged
-  WHERE previous_channel IS NULL OR channel != previous_channel
+  WHERE previous_channel IS NULL
+     OR channel != previous_channel
 ),
 
 positioned AS (
   SELECT
     *,
-    ROW_NUMBER() OVER (PARTITION BY journey_id ORDER BY raw_position) AS step_position
+    ROW_NUMBER() OVER (
+      PARTITION BY journey_id
+      ORDER BY raw_position
+    ) AS step_position
   FROM collapsed
 ),
 
 all_channels AS (
-  SELECT DISTINCT channel
+  SELECT DISTINCT
+    channel
   FROM positioned
+  WHERE channel IS NOT NULL
+    AND channel NOT IN ('START', 'PURCHASE')
 ),
 
 all_channel_pairs AS (
@@ -125,7 +138,10 @@ observed_edges AS (
   SELECT
     journey_id,
     channel AS current_channel,
-    LEAD(channel) OVER (PARTITION BY journey_id ORDER BY step_position) AS next_channel,
+    LEAD(channel) OVER (
+      PARTITION BY journey_id
+      ORDER BY step_position
+    ) AS next_channel,
     conversion_orders,
     conversion_revenue
   FROM positioned
@@ -141,7 +157,6 @@ valid_observed_edges AS (
   FROM observed_edges
   WHERE next_channel IS NOT NULL
     AND current_channel IS NOT NULL
-    AND next_channel IS NOT NULL
     AND current_channel != next_channel
     AND current_channel NOT IN ('START', 'PURCHASE')
     AND next_channel NOT IN ('START', 'PURCHASE')
@@ -156,7 +171,9 @@ transition_counts AS (
     SUM(conversion_orders) AS orders,
     SUM(conversion_revenue) AS revenue
   FROM valid_observed_edges
-  GROUP BY current_channel, next_channel
+  GROUP BY
+    current_channel,
+    next_channel
 ),
 
 complete_matrix AS (
@@ -176,7 +193,10 @@ complete_matrix AS (
 scored AS (
   SELECT
     *,
-    SUM(transition_count) OVER (PARTITION BY current_channel) AS total_next_channel_transitions_from_current,
+    SUM(transition_count) OVER (
+      PARTITION BY current_channel
+    ) AS total_next_channel_transitions_from_current,
+
     COALESCE(
       SAFE_DIVIDE(
         transition_count,
@@ -184,9 +204,14 @@ scored AS (
       ),
       0
     ) AS pct_next_channel,
+
     ROW_NUMBER() OVER (
       PARTITION BY current_channel
-      ORDER BY transition_count DESC, revenue DESC, orders DESC, next_channel ASC
+      ORDER BY
+        transition_count DESC,
+        revenue DESC,
+        orders DESC,
+        next_channel ASC
     ) AS raw_next_channel_rank
   FROM complete_matrix
 ),
@@ -194,7 +219,11 @@ scored AS (
 ranked AS (
   SELECT
     *,
-    IF(total_next_channel_transitions_from_current > 0, raw_next_channel_rank, NULL) AS next_channel_rank
+    IF(
+      total_next_channel_transitions_from_current > 0,
+      raw_next_channel_rank,
+      NULL
+    ) AS next_channel_rank
   FROM scored
 )
 
@@ -202,12 +231,12 @@ SELECT
   current_channel,
   next_channel,
 
-  -- Repeated on every row for the same current channel so Looker tables can show it.
-  MAX(IF(next_channel_rank = 1, next_channel, NULL)) OVER (PARTITION BY current_channel)
-    AS most_likely_next_channel,
+  MAX(IF(next_channel_rank = 1, next_channel, NULL)) OVER (
+    PARTITION BY current_channel
+  ) AS most_likely_next_channel,
 
   next_channel_rank,
-  next_channel_rank = 1 AS is_most_likely_next_channel,
+  IF(next_channel_rank = 1, TRUE, FALSE) AS is_most_likely_next_channel,
 
   transition_count,
   total_next_channel_transitions_from_current,
@@ -217,5 +246,4 @@ SELECT
   journeys,
   orders,
   revenue
-FROM ranked
-ORDER BY current_channel, next_channel_rank, next_channel;
+FROM ranked;
