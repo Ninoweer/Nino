@@ -2,7 +2,8 @@ name: claude-review
 # Two reviewers on every non-draft, same-repo pull request:
 #   review   — Sonnet, full review (correctness, security, data, tests, complexity).
 #   critical — Opus 5.5 at medium effort, narrow: only blocking bugs, security and data loss.
-#              Runs only when the PR changes >= 40 lines, or carries the label "critical-review".
+#              Runs only when the PR adds or deletes >= 40 lines (or >= 20 of each),
+#              or carries the label "critical-review". (Expressions have no "+", so no exact sum.)
 # Needs: the Claude GitHub app on this repo (https://github.com/apps/claude)
 # and the repo secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`).
 # Based on anthropics/claude-code-action examples/pr-review-comprehensive.yml.
@@ -61,7 +62,9 @@ jobs:
       ${{ !github.event.pull_request.draft
           && github.event.pull_request.head.repo.full_name == github.repository
           && ((github.event.action != 'labeled'
-               && github.event.pull_request.additions + github.event.pull_request.deletions >= 40)
+               && (github.event.pull_request.additions >= 40
+                   || github.event.pull_request.deletions >= 40
+                   || (github.event.pull_request.additions >= 20 && github.event.pull_request.deletions >= 20)))
               || (github.event.action == 'labeled' && github.event.label.name == 'critical-review')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
