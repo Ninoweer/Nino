@@ -1,54 +1,97 @@
 name: claude-review
-# Claude reviews every non-draft pull request and posts inline + summary comments.
-# Needs: the Claude GitHub app installed on this repo (https://github.com/apps/claude)
+# Two reviewers on every non-draft, same-repo pull request:
+#   review   — Sonnet, full review (correctness, security, data, tests, complexity).
+#   critical — Opus 5.5 at medium effort, narrow: only blocking bugs, security and data loss.
+#              Runs only when the PR changes >= 40 lines, or carries the label "critical-review".
+# Needs: the Claude GitHub app on this repo (https://github.com/apps/claude)
 # and the repo secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`).
 # Based on anthropics/claude-code-action examples/pr-review-comprehensive.yml.
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
 
 jobs:
   review:
-    # Skip drafts and PRs from forks (forks get no secrets).
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      ${{ !github.event.pull_request.draft
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && github.event.action != 'labeled' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write
+    timeout-minutes: 15
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
-      - name: Claude PR review
+      - name: Sonnet review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this pull request. Focus on what matters, in this order:
+            Review this pull request. Start from `gh pr diff`; open other files only when
+            the diff alone is not enough to judge a change. Focus, in this order:
             1. Correctness bugs and edge cases
             2. Security (secrets, injection, auth, unsafe input handling)
             3. Data and query problems (wrong joins, slow or unbounded queries)
             4. Missing or weak tests for changed behaviour
             5. Unnecessary complexity or duplication
 
-            Only report real, specific problems; skip style nitpicks and praise.
-            Use inline comments for specific lines and one short top-level summary
-            comment with a verdict (looks good / needs changes) and the key findings.
-            If the repo has a CLAUDE.md, follow its conventions.
-          # Opus at medium effort for every review ("opus" = latest Opus model).
+            Only report real, specific problems; no style nitpicks, no praise.
+            Use inline comments for specific lines, then one short top-level comment
+            headed "Claude review (Sonnet)" with a verdict (looks good / needs changes)
+            and the key findings. If the repo has a CLAUDE.md, follow its conventions.
           claude_args: |
-            --model opus --effort medium
+            --model sonnet --max-turns 20
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+  critical:
+    if: >-
+      ${{ !github.event.pull_request.draft
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && ((github.event.action != 'labeled'
+               && github.event.pull_request.additions + github.event.pull_request.deletions >= 40)
+              || (github.event.action == 'labeled' && github.event.label.name == 'critical-review')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: claude-critical-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Opus critical review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are a narrow critical reviewer. Another reviewer already covers style,
+            tests and general quality: do NOT repeat that. Read `gh pr diff` and only the
+            surrounding code you need. Report ONLY issues that would block a merge:
+            - a bug that gives wrong results, crashes or corrupts/loses data
+            - a security hole (exposed secret, injection, broken auth/permissions)
+            - an irreversible or production-breaking change (destructive migration,
+              broken public contract, query that can scan or delete far more than intended)
+            For each, be certain: name the line, the concrete failure scenario and the fix.
+            Post each as an inline comment starting with "[critical]".
+            Finish with exactly one top-level comment headed "Claude critical check (Opus)":
+            either "No blocking issues found." or a numbered list of the blocking issues.
+          claude_args: |
+            --model claude-opus-5-5 --effort medium --max-turns 15
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
